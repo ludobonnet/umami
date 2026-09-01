@@ -1,0 +1,124 @@
+# Déploiement d'Umami sur le VPS LSAN (lsan-prod) — build standalone, rsync, systemd.
+# Aucune image Docker : le serveur n'a que le runtime Node. Le Dockerfile amont sert
+# uniquement de référence pour le contrat build/runtime (build-docker, puis
+# check-db -> update-tracker -> server.js).
+name: deploy-vps
+
+on:
+  push:
+    branches: [master]
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+env:
+  PNPM_VERSION: '11.21.0'
+  PRISMA_VERSION: '7.9.1'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'          # même majeur que NodeSource sur le VPS
+          cache: pnpm
+
+      - name: Install
+        run: |
+          printf 'strictDepBuilds: false\n' > pnpm-workspace.yaml
+          pnpm install --frozen-lockfile
+
+      - name: Build
+        env:
+          # `npm run build` appellerait check-env + check-db, qui exigent une VRAIE base.
+          # `build-docker` s'en passe : URL factice, comme le Dockerfile amont.
+          DATABASE_URL: postgresql://user:pass@localhost:5432/dummy
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: |
+          cp docker/proxy.ts src/proxy.ts     # middleware du chemin self-host (absent des sources)
+          npm run build-docker
+
+      - name: Assemble l'artefact
+        run: |
+          set -euo pipefail
+          DIST=dist; rm -rf "$DIST"; mkdir -p "$DIST"
+
+          # 1) Outillage runtime AVANT le standalone (ordre du Dockerfile amont) :
+          #    le bundle standalone n'embarque ni la CLI Prisma ni les deps des scripts
+          #    de démarrage (chalk, dotenv, @prisma/adapter-pg).
+          (
+            cd "$DIST"
+            echo '{}' > package.json
+            printf "allowBuilds:\n  '@prisma/engines': true\n  prisma: false\nverifyDepsBeforeRun: false\n" > pnpm-workspace.yaml
+            pnpm add "prisma@${PRISMA_VERSION}" "@prisma/client@${PRISMA_VERSION}" \
+                     "@prisma/adapter-pg@${PRISMA_VERSION}" dotenv chalk semver npm-run-all
+            # garde-fou amont : sans les binaires d'engine, `migrate deploy` échouera au boot
+            ls node_modules/.pnpm/@prisma+engines@${PRISMA_VERSION}/node_modules/@prisma/engines/*engine* >/dev/null \
+              || { echo "::error::binaires d'engine Prisma absents"; exit 1; }
+          )
+
+          # 2) Le standalone par-dessus (apporte server.js, son package.json et ses node_modules)
+          cp -r .next/standalone/. "$DIST"/
+          mkdir -p "$DIST/.next"
+          cp -r .next/static "$DIST/.next/static"
+
+          # 3) Ce que le tracing Next n'inclut pas mais que le runtime exige
+          cp -r public prisma scripts generated geo "$DIST"/
+          cp prisma.config.ts "$DIST"/
+          rm -f "$DIST/pnpm-workspace.yaml"
+
+          test -f "$DIST/server.js"                     || { echo "::error::server.js manquant"; exit 1; }
+          test -d "$DIST/generated"                     || { echo "::error::client Prisma généré manquant"; exit 1; }
+          test -x "$DIST/node_modules/.bin/prisma"      || { echo "::error::CLI Prisma manquante"; exit 1; }
+          du -sh "$DIST"
+
+      - name: Rsync + bascule
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          set -euo pipefail
+          install -m600 /dev/stdin key <<< "${{ secrets.SSH_KEY }}"
+          # Clé d'hôte épinglée (pas de TOFU). Elle vit dans un SECRET, pas dans ce fichier :
+          # ce dépôt est public, et publier l'IP d'origine annulerait l'intérêt du tunnel
+          # Cloudflare (l'origine ne doit jamais être découvrable).
+          install -m644 /dev/stdin known_hosts <<< "${{ secrets.SSH_KNOWN_HOSTS }}"
+          SSHOPT="-i key -o UserKnownHostsFile=known_hosts -o StrictHostKeyChecking=yes"
+
+          rsync -az --delete -e "ssh $SSHOPT" dist/ \
+            "$SSH_USER@$SSH_HOST:/srv/umami/releases/${{ github.sha }}/"
+
+          # deploy.sh : flip atomique du symlink `current` + systemctl restart umami
+          # (les migrations tournent en ExecStartPre via scripts/check-db.js)
+          ssh $SSHOPT "$SSH_USER@$SSH_HOST" "/srv/lsan/deploy.sh umami ${{ github.sha }}"
+
+      - name: Vérification
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          set -euo pipefail
+          SSHOPT="-i key -o UserKnownHostsFile=known_hosts -o StrictHostKeyChecking=yes"
+          for i in $(seq 1 30); do
+            if ssh $SSHOPT "$SSH_USER@$SSH_HOST" 'curl -fsS -o /dev/null -w "%{http_code}" http://127.0.0.1:3002/api/heartbeat' 2>/dev/null | grep -qE '200|401'; then
+              echo "✅ Umami répond sur :3002"; exit 0
+            fi
+            sleep 4
+          done
+          # Volontairement PAS de dump de journalctl ici : les logs Actions d'un dépôt public
+          # sont publics, et le journal d'Umami peut contenir la DATABASE_URL en cas d'échec
+          # de connexion. On ne remonte que l'état du service, jamais son contenu.
+          echo "::error::Umami ne répond pas après 120 s — inspecter sur le serveur :"
+          echo "  ssh ludo@<vps> 'journalctl -u umami -n 80 --no-pager'"
+          ssh $SSHOPT "$SSH_USER@$SSH_HOST" 'systemctl is-active umami; systemctl show umami -p NRestarts --value' || true
+          exit 1
