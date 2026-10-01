@@ -15,8 +15,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PNPM_VERSION: '11.21.0'
-  PRISMA_VERSION: '7.9.1'
+  PNPM_VERSION: '12.3.4'     # = engines.pnpm du package.json amont
+  PRISMA_VERSION: '7.10.0'   # = ARG PRISMA_VERSION du Dockerfile amont
 
 jobs:
   deploy:
@@ -35,18 +35,20 @@ jobs:
 
       - name: Install
         run: |
-          printf 'strictDepBuilds: false\n' > pnpm-workspace.yaml
+          # append (comme le Dockerfile amont) : écraser le fichier perdrait les
+          # overrides du workspace et casserait --frozen-lockfile
+          printf 'strictDepBuilds: false\n' >> pnpm-workspace.yaml
           pnpm install --frozen-lockfile
 
       - name: Build
         env:
           # `npm run build` appellerait check-env + check-db, qui exigent une VRAIE base.
-          # `build-docker` s'en passe : URL factice, comme le Dockerfile amont.
+          # `build:docker` s'en passe : URL factice, comme le Dockerfile amont.
           DATABASE_URL: postgresql://user:pass@localhost:5432/dummy
           NEXT_TELEMETRY_DISABLED: '1'
         run: |
           cp docker/proxy.ts src/proxy.ts     # middleware du chemin self-host (absent des sources)
-          npm run build-docker
+          pnpm build:docker                   # build:openapi/build:packages appellent pnpm
 
       - name: Assemble l'artefact
         run: |
